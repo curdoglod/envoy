@@ -131,6 +131,13 @@ envoy.extensions.http.cache.file_system_http_cache:
   status: wip
   type_urls:
   - envoy.extensions.http.cache.file_system_http_cache.v3.FileSystemHttpCacheConfig
+envoy.extensions.http.cache.ring:
+  categories:
+  - envoy.http.cache
+  security_posture: unknown
+  status: wip
+  type_urls:
+  - envoy.extensions.http.cache.ring_http_cache.v3.RingHttpCacheConfig
 envoy.extensions.http.cache.simple:
   categories:
   - envoy.http.cache

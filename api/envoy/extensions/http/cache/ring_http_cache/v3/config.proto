@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package envoy.extensions.http.cache.ring_http_cache.v3;
+
+import "udpa/annotations/status.proto";
+import "validate/validate.proto";
+
+option java_package = "io.envoyproxy.envoy.extensions.http.cache.ring_http_cache.v3";
+option java_outer_classname = "ConfigProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/http/cache/ring_http_cache/v3;ring_http_cachev3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+
+// [#protodoc-title: RingHttpCache CacheFilter storage plugin]
+
+// [#extension: envoy.extensions.http.cache.ring]
+message RingHttpCacheConfig {
+    uint32 ring_size = 1 [(validate.rules).uint32 = {gt: 0}];
+}
