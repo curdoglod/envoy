@@ -1,5 +1,8 @@
 #pragma once
 
+#include <functional>
+#include <memory>
+
 #include "envoy/extensions/http/cache/ring_http_cache/v3/config.pb.h"
 
 #include "source/common/protobuf/utility.h"
@@ -32,18 +35,30 @@ private:
     bool occupied = false;
   };
 
+  struct Subscriber {
+    Event::Dispatcher* dispatcher;
+    std::function<void()> wake;
+    std::shared_ptr<bool> cancelled;
+  };
+
+  struct Inflight {
+    std::vector<Subscriber> subscribers;
+  };
+
 
   const uint32_t ring_size_;
   absl::Mutex mutex_;
   std::vector<Slot> slots_ ABSL_GUARDED_BY(mutex_);
   uint32_t next_slot_ ABSL_GUARDED_BY(mutex_) = 0;
   absl::flat_hash_map<Key, uint32_t, MessageUtil, MessageUtil> index_ ABSL_GUARDED_BY(mutex_);
+  absl::flat_hash_map<Key, Inflight, MessageUtil, MessageUtil> inflight_ ABSL_GUARDED_BY(mutex_);
 
   bool insertOrUpdateSlot(const Key& key, Entry&& entry) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  Entry lookupLocked(const LookupRequest& request) ABSL_SHARED_LOCKS_REQUIRED(mutex_);
 
-  // Looks for a response that has been varied. Only called from lookup.
-  Entry varyLookup(const LookupRequest& request,
-                   const Http::ResponseHeaderMapPtr& response_headers);
+  // Looks for a response that has been varied. Only called from lookup methods.
+  Entry varyLookup(const LookupRequest& request, const Http::ResponseHeaderMapPtr& response_headers)
+      ABSL_SHARED_LOCKS_REQUIRED(mutex_);
 
   // A list of headers that we do not want to update upon validation
   // We skip these headers because either it's updated by other application logic
@@ -52,6 +67,8 @@ private:
   static const absl::flat_hash_set<Http::LowerCaseString> headersNotToUpdate();
 
 public:
+  enum class LookupOutcome { Hit, MissBecameLeader, MissSubscribed };
+
   explicit RingHttpCache(const ConfigProto& config);
   // HttpCache
   LookupContextPtr makeLookupContext(LookupRequest&& request,
@@ -64,6 +81,11 @@ public:
   CacheInfo cacheInfo() const override;
 
   Entry lookup(const LookupRequest& request);
+  LookupOutcome lookupOrSubscribe(const LookupRequest& request, Entry& out_entry,
+                                  Event::Dispatcher& dispatcher, std::function<void()> wake,
+                                  std::shared_ptr<bool> cancelled);
+  void completeInflight(const Key& key);
+
   bool insert(const Key& key, Http::ResponseHeaderMapPtr&& response_headers,
               ResponseMetadata&& metadata, std::string&& body,
               Http::ResponseTrailerMapPtr&& trailers);

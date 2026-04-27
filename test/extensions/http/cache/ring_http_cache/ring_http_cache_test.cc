@@ -110,6 +110,113 @@ TEST(RingHttpCacheEviction, EvictsOldestEntryWhenFull) {
   EXPECT_TRUE(hasCachedResponse(cache, "/b", vary_allow_list));
 }
 
+TEST(RingHttpCacheCoalescing, SubscribedWakesOnCommit) {
+  ConfigProto config;
+  config.set_ring_size(4);
+  RingHttpCache cache(config);
+
+  envoy::extensions::filters::http::cache::v3::CacheConfig cache_filter_config;
+  testing::NiceMock<Server::Configuration::MockServerFactoryContext> factory_context;
+  VaryAllowList vary_allow_list(cache_filter_config.allowed_vary_headers(), factory_context);
+  LookupRequest request = makeLookupRequest("/coalesced", vary_allow_list);
+
+  Api::ApiPtr api = Api::createApiForTest();
+  Event::DispatcherPtr dispatcher = api->allocateDispatcher("test_thread");
+
+  auto entry = cache.lookup(request);
+  auto leader_cancelled = std::make_shared<bool>(false);
+  EXPECT_EQ(cache.lookupOrSubscribe(request, entry, *dispatcher, [] {}, leader_cancelled),
+            RingHttpCache::LookupOutcome::MissBecameLeader);
+
+  bool wake_called = false;
+  auto subscriber_cancelled = std::make_shared<bool>(false);
+  EXPECT_EQ(cache.lookupOrSubscribe(request, entry, *dispatcher,
+                                    [&wake_called]() { wake_called = true; },
+                                    subscriber_cancelled),
+            RingHttpCache::LookupOutcome::MissSubscribed);
+
+  cache.completeInflight(request.key());
+  dispatcher->run(Event::Dispatcher::RunType::NonBlock);
+
+  EXPECT_TRUE(wake_called);
+}
+
+TEST(RingHttpCacheCoalescing, SubscribedBecomesLeaderAfterFailedInsert) {
+  ConfigProto config;
+  config.set_ring_size(4);
+  RingHttpCache cache(config);
+
+  envoy::extensions::filters::http::cache::v3::CacheConfig cache_filter_config;
+  testing::NiceMock<Server::Configuration::MockServerFactoryContext> factory_context;
+  VaryAllowList vary_allow_list(cache_filter_config.allowed_vary_headers(), factory_context);
+  LookupRequest request = makeLookupRequest("/uncacheable", vary_allow_list);
+
+  Api::ApiPtr api = Api::createApiForTest();
+  Event::DispatcherPtr dispatcher = api->allocateDispatcher("test_thread");
+
+  auto entry = cache.lookup(request);
+  auto leader_cancelled = std::make_shared<bool>(false);
+  EXPECT_EQ(cache.lookupOrSubscribe(request, entry, *dispatcher, [] {}, leader_cancelled),
+            RingHttpCache::LookupOutcome::MissBecameLeader);
+
+  bool retry_lookup_called = false;
+  RingHttpCache::LookupOutcome retry_outcome = RingHttpCache::LookupOutcome::MissSubscribed;
+  auto subscriber_cancelled = std::make_shared<bool>(false);
+  EXPECT_EQ(cache.lookupOrSubscribe(
+                request, entry, *dispatcher,
+                [&cache, &request, &dispatcher, &retry_lookup_called, &retry_outcome,
+           subscriber_cancelled]() mutable {
+                  retry_lookup_called = true;
+                  decltype(entry) retry_entry;
+                  retry_outcome = cache.lookupOrSubscribe(request, retry_entry, *dispatcher, [] {},
+                                                         subscriber_cancelled);
+                },
+                subscriber_cancelled),
+            RingHttpCache::LookupOutcome::MissSubscribed);
+
+  // Simulate leader completion without insert (uncacheable/failure path).
+  cache.completeInflight(request.key());
+  dispatcher->run(Event::Dispatcher::RunType::NonBlock);
+
+  EXPECT_TRUE(retry_lookup_called);
+  EXPECT_EQ(retry_outcome, RingHttpCache::LookupOutcome::MissBecameLeader);
+
+  // Cleanup inflight state from retry leader.
+  cache.completeInflight(request.key());
+}
+
+TEST(RingHttpCacheCoalescing, CancelledSubscriberDoesNotWake) {
+  ConfigProto config;
+  config.set_ring_size(4);
+  RingHttpCache cache(config);
+
+  envoy::extensions::filters::http::cache::v3::CacheConfig cache_filter_config;
+  testing::NiceMock<Server::Configuration::MockServerFactoryContext> factory_context;
+  VaryAllowList vary_allow_list(cache_filter_config.allowed_vary_headers(), factory_context);
+  LookupRequest request = makeLookupRequest("/cancelled", vary_allow_list);
+
+  Api::ApiPtr api = Api::createApiForTest();
+  Event::DispatcherPtr dispatcher = api->allocateDispatcher("test_thread");
+
+  auto entry = cache.lookup(request);
+  auto leader_cancelled = std::make_shared<bool>(false);
+  EXPECT_EQ(cache.lookupOrSubscribe(request, entry, *dispatcher, [] {}, leader_cancelled),
+            RingHttpCache::LookupOutcome::MissBecameLeader);
+
+  bool wake_called = false;
+  auto subscriber_cancelled = std::make_shared<bool>(false);
+  EXPECT_EQ(cache.lookupOrSubscribe(request, entry, *dispatcher,
+                                    [&wake_called]() { wake_called = true; },
+                                    subscriber_cancelled),
+            RingHttpCache::LookupOutcome::MissSubscribed);
+
+  *subscriber_cancelled = true;
+  cache.completeInflight(request.key());
+  dispatcher->run(Event::Dispatcher::RunType::NonBlock);
+
+  EXPECT_FALSE(wake_called);
+}
+
 } // namespace
 } // namespace Cache
 } // namespace HttpFilters

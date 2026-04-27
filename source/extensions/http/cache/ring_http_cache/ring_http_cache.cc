@@ -36,21 +36,11 @@ public:
   RingLookupContext(Event::Dispatcher& dispatcher, RingHttpCache& cache, LookupRequest&& request)
       : dispatcher_(dispatcher), cache_(cache), request_(std::move(request)) {}
 
+  ~RingLookupContext() override { destroy(); }
+
   void getHeaders(LookupHeadersCallback&& cb) override {
-    auto entry = cache_.lookup(request_);
-    body_ = std::move(entry.body_);
-    trailers_ = std::move(entry.trailers_);
-    LookupResult result = entry.response_headers_
-                              ? request_.makeLookupResult(std::move(entry.response_headers_),
-                                                          std::move(entry.metadata_), body_.size())
-                              : LookupResult{};
-    bool end_stream = body_.empty() && trailers_ == nullptr;
-    dispatcher_.post([result = std::move(result), cb = std::move(cb), end_stream,
-                      cancelled = cancelled_]() mutable {
-      if (!*cancelled) {
-        std::move(cb)(std::move(result), end_stream);
-      }
-    });
+    pending_cb_ = std::move(cb);
+    resolveLookup();
   }
 
   void getBody(const AdjustedByteRange& range, LookupBodyCallback&& cb) override {
@@ -77,14 +67,74 @@ public:
   }
 
   const LookupRequest& request() const { return request_; }
-  void onDestroy() override { *cancelled_ = true; }
+  void onDestroy() override { destroy(); }
   Event::Dispatcher& dispatcher() const { return dispatcher_; }
+  void transferLeadership() { leadership_transferred_ = true; }
 
 private:
+  void destroy() {
+    if (destroyed_) {
+      return;
+    }
+
+    destroyed_ = true;
+    *cancelled_ = true;
+    if (became_leader_ && !leadership_transferred_) {
+      cache_.completeInflight(request_.key());
+    }
+  }
+
+  void resolveLookup() {
+    decltype(cache_.lookup(request_)) entry;
+    auto cancelled = cancelled_;
+    auto wake = [this, cancelled]() {
+      if (*cancelled) {
+        return;
+      }
+      resolveLookup();
+    };
+
+    const RingHttpCache::LookupOutcome outcome = cache_.lookupOrSubscribe(
+        request_, entry, dispatcher_, std::move(wake), cancelled_);
+
+    switch (outcome) {
+    case RingHttpCache::LookupOutcome::Hit:
+      serve(std::move(entry));
+      return;
+    case RingHttpCache::LookupOutcome::MissBecameLeader:
+      became_leader_ = true;
+      serve(decltype(entry){});
+      return;
+    case RingHttpCache::LookupOutcome::MissSubscribed:
+      return;
+    }
+    PANIC_DUE_TO_CORRUPT_ENUM;
+  }
+
+  template <typename EntryType> void serve(EntryType entry) {
+    body_ = std::move(entry.body_);
+    trailers_ = std::move(entry.trailers_);
+    LookupResult result = entry.response_headers_
+                              ? request_.makeLookupResult(std::move(entry.response_headers_),
+                                                          std::move(entry.metadata_), body_.size())
+                              : LookupResult{};
+    bool end_stream = body_.empty() && trailers_ == nullptr;
+    dispatcher_.post([result = std::move(result), cb = std::move(pending_cb_), end_stream,
+                      cancelled = cancelled_]() mutable {
+      if (!*cancelled) {
+        std::move(cb)(std::move(result), end_stream);
+      }
+    });
+  }
+
   Event::Dispatcher& dispatcher_;
   std::shared_ptr<bool> cancelled_ = std::make_shared<bool>(false);
   RingHttpCache& cache_;
   const LookupRequest request_;
+  bool became_leader_ = false;
+  bool leadership_transferred_ = false;
+  bool destroyed_ = false;
+  LookupHeadersCallback pending_cb_;
   std::string body_;
   Http::ResponseTrailerMapPtr trailers_;
 };
@@ -137,19 +187,28 @@ public:
     post(std::move(insert_complete), commit());
   }
 
-  void onDestroy() override { *cancelled_ = true; }
+  void onDestroy() override {
+    *cancelled_ = true;
+    if (!committed_) {
+      cache_.completeInflight(key_);
+    }
+  }
 
 private:
   bool commit() {
     committed_ = true;
+    bool result;
     if (VaryHeaderUtils::hasVary(*response_headers_)) {
-      return cache_.varyInsert(key_, std::move(response_headers_), std::move(metadata_),
-                               body_.toString(), request_headers_, vary_allow_list_,
-                               std::move(trailers_));
+      result = cache_.varyInsert(key_, std::move(response_headers_), std::move(metadata_),
+                                 body_.toString(), request_headers_, vary_allow_list_,
+                                 std::move(trailers_));
     } else {
-      return cache_.insert(key_, std::move(response_headers_), std::move(metadata_),
-                           body_.toString(), std::move(trailers_));
+      result = cache_.insert(key_, std::move(response_headers_), std::move(metadata_),
+                             body_.toString(), std::move(trailers_));
     }
+
+    cache_.completeInflight(key_);
+    return result;
   }
 
   Event::Dispatcher& dispatcher_;
@@ -229,8 +288,7 @@ void RingHttpCache::updateHeaders(const LookupContext& lookup_context,
   std::move(post_complete)(true);
 }
 
-RingHttpCache::Entry RingHttpCache::lookup(const LookupRequest& request) {
-  absl::ReaderMutexLock lock(mutex_);
+RingHttpCache::Entry RingHttpCache::lookupLocked(const LookupRequest& request) {
   auto it = index_.find(request.key());
   if (it == index_.end()) {
     return Entry{};
@@ -242,15 +300,69 @@ RingHttpCache::Entry RingHttpCache::lookup(const LookupRequest& request) {
 
   if (VaryHeaderUtils::hasVary(*target->entry.response_headers_)) {
     return varyLookup(request, target->entry.response_headers_);
-  } else {
-    Http::ResponseTrailerMapPtr trailers_map;
-    if (target->entry.trailers_) {
-      trailers_map =
-          Http::createHeaderMap<Http::ResponseTrailerMapImpl>(*target->entry.trailers_);
+  }
+
+  Http::ResponseTrailerMapPtr trailers_map;
+  if (target->entry.trailers_) {
+    trailers_map = Http::createHeaderMap<Http::ResponseTrailerMapImpl>(*target->entry.trailers_);
+  }
+  return RingHttpCache::Entry{
+      Http::createHeaderMap<Http::ResponseHeaderMapImpl>(*target->entry.response_headers_),
+      target->entry.metadata_, target->entry.body_, std::move(trailers_map)};
+}
+
+RingHttpCache::Entry RingHttpCache::lookup(const LookupRequest& request) {
+  absl::ReaderMutexLock lock(mutex_);
+  return lookupLocked(request);
+}
+
+RingHttpCache::LookupOutcome RingHttpCache::lookupOrSubscribe(
+    const LookupRequest& request, Entry& out_entry, Event::Dispatcher& dispatcher,
+    std::function<void()> wake, std::shared_ptr<bool> cancelled) {
+  absl::WriterMutexLock lock(mutex_);
+
+  Entry entry = lookupLocked(request);
+  if (entry.response_headers_ != nullptr) {
+    out_entry = std::move(entry);
+    return LookupOutcome::Hit;
+  }
+
+  const Key& key = request.key();
+  auto it = inflight_.find(key);
+  if (it != inflight_.end()) {
+    it->second.subscribers.push_back(
+        Subscriber{&dispatcher, std::move(wake), std::move(cancelled)});
+    return LookupOutcome::MissSubscribed;
+  }
+
+  inflight_.emplace(key, Inflight{});
+  return LookupOutcome::MissBecameLeader;
+}
+
+void RingHttpCache::completeInflight(const Key& key) {
+  std::vector<Subscriber> subscribers;
+  {
+    absl::WriterMutexLock lock(mutex_);
+    auto it = inflight_.find(key);
+    if (it == inflight_.end()) {
+      return;
     }
-    return RingHttpCache::Entry{
-        Http::createHeaderMap<Http::ResponseHeaderMapImpl>(*target->entry.response_headers_),
-        target->entry.metadata_, target->entry.body_, std::move(trailers_map)};
+
+    subscribers = std::move(it->second.subscribers);
+    inflight_.erase(it);
+  }
+
+  for (auto& subscriber : subscribers) {
+    if (*subscriber.cancelled) {
+      continue;
+    }
+
+    subscriber.dispatcher->post(
+        [wake = std::move(subscriber.wake), cancelled = subscriber.cancelled]() mutable {
+          if (!*cancelled) {
+            wake();
+          }
+        });
   }
 }
 
@@ -295,9 +407,6 @@ bool RingHttpCache::insert(const Key& key, Http::ResponseHeaderMapPtr&& response
 RingHttpCache::Entry
 RingHttpCache::varyLookup(const LookupRequest& request,
                           const Http::ResponseHeaderMapPtr& response_headers) {
-  // This method should be called from lookup, which holds the mutex for reading.
-  mutex_.AssertReaderHeld();
-
   absl::optional<Key> varied_key = variedRequestKey(request, *response_headers);
   if (!varied_key.has_value()) {
     return RingHttpCache::Entry{};
@@ -380,8 +489,9 @@ bool RingHttpCache::varyInsert(const Key& request_key,
 InsertContextPtr RingHttpCache::makeInsertContext(LookupContextPtr&& lookup_context,
                                                   Http::StreamFilterCallbacks&) {
   ASSERT(lookup_context != nullptr);
-  auto ret = std::make_unique<RingInsertContext>(
-      dynamic_cast<RingLookupContext&>(*lookup_context), *this);
+  auto& ring_lookup_context = dynamic_cast<RingLookupContext&>(*lookup_context);
+  ring_lookup_context.transferLeadership();
+  auto ret = std::make_unique<RingInsertContext>(ring_lookup_context, *this);
   lookup_context->onDestroy();
   return ret;
 }
